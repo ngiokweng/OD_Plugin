@@ -1,6 +1,8 @@
 ﻿#include <Windows.h>
 #include "plugin.h"
 #include <iostream>
+#include <fstream>
+using namespace std;
 
 ////////////////////////////////////////////////
 //plugin.h中有如下定義：////                                                                      
@@ -58,13 +60,17 @@ extc int _export cdecl _ODBG_Plugininit(int ollydbgversion, HWND hw, ulong* feat
 備    注：每個菜單項之間用'|'or','字符隔開
 ************************************************************************/
 extc int  _export cdecl _ODBG_Pluginmenu(int origin, char data[4096], void* item){
-	//PM_DISASM代表在OD的反匯編窗口中點擊
+	//PM_DISASM代表在OD的反匯編窗口
 	if (origin == PM_DISASM) {
 		strcpy_s(data, 4096, "我的插件{0&call重命名}"); //子菜單寫法，數字是每個item的編號( 只要不一樣就可以，不一定要按順序，但數值不能太大 )
 	}
 	//PM_DISASM代表數據窗口
 	if (origin == PM_CPUDUMP) {
 		strcpy_s(data, 4096, "我的插件{0&Memory Dump to exe}");
+	}
+	//PM_MAIN代表主窗口
+	if (origin == PM_MAIN) {
+		strcpy_s(data, 4096, "0&JCC追蹤記錄");
 	}
 
 	return TRUE;
@@ -120,8 +126,6 @@ void RenameCall(t_dump* ptDump) {
 	}
 }
 
-#include <fstream>
-using namespace std;
 
 /************************************************************************
 函數名稱：MemDump
@@ -151,6 +155,88 @@ void MemDump(t_dump* ptDump) {
 	delete[] buf;
 }
 
+
+#include <vector>
+struct Info
+{
+	ulong address;
+	char* msg;
+};
+vector<Info> infoArr;
+ulong nextAddress = 0;
+bool flag = false;
+
+/************************************************************************
+函數名稱：JccRecord
+函數功能：在OD日志窗口(alt+l)記錄跳轉指令的實現與否
+返 回 值：無
+************************************************************************/
+void JccRecord() {
+	//獲取CPU反匯編窗口的t_dump結構體
+	t_dump* t_diasm = (t_dump*)Plugingetvalue(VAL_CPUDASM);
+	/***以下操作是獲取當前地址的匯編指令(存放在td.result中)***/
+	byte buf[16] = { 0 }; //長度16是因為硬編碼就長不超過16(<=15)
+	ulong currentAddress = t_diasm->sel0;
+	Readmemory(buf, currentAddress, 16, MM_SILENT);
+	t_disasm td;
+	ulong lSize = Disasm(buf, 16, currentAddress, NULL, &td, DISASM_ALL, NULL); //反匯編引擎
+	//判斷nextAddress是否為0，不為0即代表上一條指令是JCC指令
+	if (nextAddress != 0) {
+		//若nextAddress == currentAddress即代表上一條跳轉指令沒有實現
+		if (nextAddress == currentAddress)
+			infoArr[0].msg = (char*)"跳轉未實現";
+		else
+			infoArr[0].msg = (char*)"跳轉已實現";
+		//在日志窗口顯示出來
+		Addtolist(infoArr[0].address, 1, (char*)infoArr[0].msg);
+		//清空infoArr數組(讓其保持size=1)
+		infoArr.clear();
+		nextAddress = 0;
+	}
+	//簡單判斷匯編指令是否以'j'開頭，若是則為跳轉指令(雖然很有可能出錯，但不管)
+	if (td.result[0] == 'j') {
+		Info tmp;
+		tmp.address = currentAddress;
+		tmp.msg = (char*)"未知跳轉";
+		nextAddress = t_diasm->sel1;
+		infoArr.emplace_back(tmp);
+	}
+
+	//遇到int3斷點時就停下
+	if (buf[0] == 0xCC) {
+		//初始化
+		flag = false;
+		nextAddress = 0;
+		infoArr.clear();
+		return;
+	}
+	//若不是int3斷點則繼續F8
+	Go(0, 0, STEP_OVER, 0, 0);
+}
+
+/************************************************************************
+函數名稱：_ODBG_Pausedex
+函數功能：可選回調函數，如果使用，OD在被調試程序暫停時或一個內部進程完成時調用本函數
+參  數 1：reason 應用程序暫停原因
+參  數 2：extdata 保留，總為0
+參  數 3：reg 指向已暫停應用程序的線程寄存器，可為NULL
+參  數 4：debugevent 指向暫停發生時的調試事件，可為NULL(如果無調試事件)
+返 回 值：無
+************************************************************************/
+extc int _export cdecl _ODBG_Pausedex(int reason, int extdata, t_reg* reg, DEBUG_EVENT* debugevent) {
+	//reason：單步步入(F7)和單步步過(F8)都是PP_SINGLESTEP
+	//注：只有單步步過(F8)call指令時才是PP_HWBREAK	
+	if (flag) {
+		if (reason == PP_SINGLESTEP || reason == PP_HWBREAK) {
+			JccRecord();
+		}
+	}
+	return 1;
+}
+
+
+
+
 /************************************************************************
 函數名稱：_ODBG_Pluginaction
 函數功能：響應菜單事件
@@ -178,6 +264,17 @@ extc void _export cdecl _ODBG_Pluginaction(int origin, int action, void* item)
 		case 0:
 			RenameCall((t_dump*)item);
 			break;
+		}
+	}
+
+	if (origin == PM_MAIN) {
+		switch (action)
+		{
+		case 0: {
+			flag = true;
+			Go(0, 0, STEP_OVER, 0, 0);
+			break;
+		}
 		}
 	}
 
